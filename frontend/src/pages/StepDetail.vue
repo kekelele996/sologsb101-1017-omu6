@@ -13,7 +13,9 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useDrawStore } from '@/stores/drawStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import type { Draw } from '@/types/draw'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
 
@@ -21,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const drawStore = useDrawStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
@@ -70,10 +73,170 @@ const tempCheck = computed(() =>
 
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
 
+/* ---------------- 技师那本账：取料道次 ---------------- */
+
+const drawDialog = ref(false)
+const drawSubmitting = ref(false)
+/** 0 = 首次登记；>0 = 重试对应取料道次 */
+const editingDrawId = ref<string | null>(null)
+/** 本道次关联的取料工序（可空） */
+const drawStep = ref<Step | null>(null)
+const drawFormRef = ref<FormInstance>()
+
+const drawForm = reactive({
+  seq: 1,
+  stepId: '',
+  batchId: '',
+  drawKg: 5,
+  operator: '',
+})
+
+const drawRules: FormRules<typeof drawForm> = {
+  seq: [{ required: true, message: '请填写取料道次', trigger: 'blur' }],
+  batchId: [{ required: true, message: '请选择料液批次', trigger: 'change' }],
+  drawKg: [{ required: true, message: '请填写取料量', trigger: 'blur' }],
+  operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
+}
+
+const pieceDraws = computed<Draw[]>(() => drawStore.drawsOfPiece(pieceId.value))
+const rejectedDraws = computed<Draw[]>(() => pieceDraws.value.filter((row) => row.state === '已退回'))
+const postedDrawKg = computed<number>(() =>
+  Math.round(pieceDraws.value.filter((row) => row.state === '已落账').reduce((acc, row) => acc + row.drawKg, 0) * 100) / 100,
+)
+
+/** 取料工序 → 取料道次（优先按 stepId 关联，迁移数据再按 seq 兜底） */
+function drawOfStep(step: Step): Draw | undefined {
+  return pieceDraws.value.find((row) => row.stepId === step.id) ?? pieceDraws.value.find((row) => row.seq === step.seq)
+}
+
+const drawBatchOptions = computed(() =>
+  furnaceStore.batches
+    .slice()
+    .sort((a, b) => b.meltDate.localeCompare(a.meltDate))
+    .map((row) => ({
+      id: row.id,
+      label: `${row.colorCode} · 第${row.cycle}轮 · 余 ${row.remainKg} kg（${furnaceStore.furnaces.find((f) => f.id === row.furnaceId)?.code ?? '未知窑'}）`,
+    })),
+)
+
+const selectedBatchRemain = computed<number>(() => {
+  const batch = furnaceStore.batches.find((row) => row.id === drawForm.batchId)
+  return batch?.remainKg ?? 0
+})
+
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
+  void drawStore.loadAll()
 })
+
+/** 首次登记取料道次（可从某道「取料」工序进入） */
+function openCreateDraw(step: Step | null): void {
+  if (piece.value === null) return
+  editingDrawId.value = null
+  drawStep.value = step
+  const usedSeqs = new Set(pieceDraws.value.map((row) => row.seq))
+  let nextSeq = step?.seq ?? drawStore.nextSeqOfPiece(pieceId.value)
+  // 道次冲突时顺延到下一个空号
+  while (usedSeqs.has(nextSeq)) nextSeq += 1
+  Object.assign(drawForm, {
+    seq: nextSeq,
+    stepId: step?.id ?? '',
+    batchId: piece.value.batchId || furnaceStore.batches[0]?.id || '',
+    drawKg: 5,
+    operator: step?.operator || piece.value.artist || '',
+  })
+  drawDialog.value = true
+}
+
+/** 重试退回的取料道次（只重试技师这一条，可改批次/用量/操作人） */
+function openRetryDraw(row: Draw): void {
+  editingDrawId.value = row.id
+  drawStep.value = steps.value.find((step) => step.id === row.stepId) ?? null
+  Object.assign(drawForm, {
+    seq: row.seq,
+    stepId: row.stepId,
+    batchId: row.batchId && furnaceStore.batches.some((b) => b.id === row.batchId) ? row.batchId : piece.value?.batchId || '',
+    drawKg: row.drawKg,
+    operator: row.operator,
+  })
+  drawDialog.value = true
+}
+
+async function submitDraw(): Promise<void> {
+  if (drawFormRef.value === undefined || piece.value === null) return
+  const valid = await drawFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  // 道次唯一性（重试自身除外）
+  const dup = pieceDraws.value.find((row) => row.seq === drawForm.seq && row.id !== editingDrawId.value)
+  if (dup !== undefined) {
+    ElMessage.warning(`第 ${drawForm.seq} 取料道次已记账（${dup.state} ${dup.drawKg} kg），一道次只记一条`)
+    return
+  }
+  drawSubmitting.value = true
+  try {
+    if (editingDrawId.value === null) {
+      const result = await drawStore.submitDraw({
+        pieceId: pieceId.value,
+        seq: drawForm.seq,
+        stepId: drawForm.stepId,
+        batchId: drawForm.batchId,
+        drawKg: drawForm.drawKg,
+        operator: drawForm.operator,
+      })
+      if (result.ok) {
+        ElMessage.success(result.message)
+        drawDialog.value = false
+      } else {
+        ElMessage.error(result.message)
+        drawDialog.value = false
+      }
+    } else {
+      const result = await drawStore.retryDraw(editingDrawId.value, {
+        stepId: drawForm.stepId,
+        batchId: drawForm.batchId,
+        drawKg: drawForm.drawKg,
+        operator: drawForm.operator,
+      })
+      if (result.ok) {
+        ElMessage.success(result.message)
+        drawDialog.value = false
+      } else {
+        ElMessage.error(result.message)
+        drawDialog.value = false
+      }
+    }
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : '取料道次保存失败')
+  } finally {
+    drawSubmitting.value = false
+  }
+}
+
+async function quickRetryDraw(row: Draw): Promise<void> {
+  try {
+    const result = await drawStore.retryDraw(row.id)
+    if (result.ok) ElMessage.success(result.message)
+    else ElMessage.error(result.message)
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : '取料道次重试失败')
+  }
+}
+
+async function discardDraw(row: Draw): Promise<void> {
+  try {
+    await ElMessageBox.confirm(`撤销第 ${row.seq} 道退回的取料记录？批次侧从未被扣减，无需补偿。`, '撤销退回记录', {
+      type: 'warning',
+      confirmButtonText: '撤销',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  await drawStore.discardRejected(row.id)
+  ElMessage.success('已撤销该退回记录')
+}
+
 
 function openCreate(): void {
   editingId.value = null
@@ -292,6 +455,15 @@ function goAnnealing(): void {
                   {{ row.state }}
                 </el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
+                <el-tag
+                  v-if="row.name === '取料' && drawOfStep(row)"
+                  size="small"
+                  :type="drawOfStep(row)?.state === '已落账' ? 'success' : 'danger'"
+                  effect="plain"
+                >
+                  取料账：{{ drawOfStep(row)?.batchColorCode }} · {{ drawOfStep(row)?.drawKg }} kg ·
+                  {{ drawOfStep(row)?.state === '已落账' ? '已落账' : `已退回·${drawOfStep(row)?.rejectReason}` }}
+                </el-tag>
               </div>
               <div class="step-sub">
                 {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
@@ -299,6 +471,24 @@ function goAnnealing(): void {
               </div>
             </div>
             <div class="step-actions">
+              <el-button
+                v-if="row.name === '取料' && !drawOfStep(row)"
+                size="small"
+                type="success"
+                plain
+                @click="openCreateDraw(row)"
+              >
+                记取料道次
+              </el-button>
+              <el-button
+                v-else-if="row.name === '取料' && drawOfStep(row)?.state === '已退回'"
+                size="small"
+                type="danger"
+                plain
+                @click="openRetryDraw(drawOfStep(row)!)"
+              >
+                本侧重试
+              </el-button>
               <el-button
                 size="small"
                 type="primary"
@@ -310,6 +500,74 @@ function goAnnealing(): void {
               </el-button>
               <el-button size="small" @click="openEdit(row)">编辑</el-button>
               <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
+            </div>
+          </li>
+        </ul>
+      </el-card>
+
+      <!-- 技师账：本作品取料道次 -->
+      <el-card shadow="never" class="mt-14 draw-card">
+        <template #header>
+          <div class="card-header">
+            <span class="card-header__title">技师取料账 · 取料道次（哪批料 / 取多少 / 操作人）</span>
+            <el-space wrap>
+              <el-tag type="success" effect="plain">已落账取料合计 {{ postedDrawKg }} kg</el-tag>
+              <el-tag v-if="rejectedDraws.length > 0" type="danger" effect="dark">{{ rejectedDraws.length }} 道已退回</el-tag>
+              <el-button type="primary" @click="openCreateDraw(null)">
+                <el-icon><Plus /></el-icon>
+                <span>记取料道次</span>
+              </el-button>
+            </el-space>
+          </div>
+        </template>
+
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          title="保存时按批次当时余量扣减；两个终端同时取一批料，晚到且余量不足的那次只退回这一条并写明原因，别人取走的不动。退回后只在技师本侧重试。"
+        />
+
+        <EmptyPanel
+          v-if="pieceDraws.length === 0"
+          title="这件作品还没有取料道次"
+          description="每次取料单独记一道：选用哪批料、取多少、谁操作；落账后批次余量同步扣减并保存批次色号/配方快照。"
+          action-text="记第一道取料"
+          @action="openCreateDraw(null)"
+        />
+
+        <ul v-else class="draw-list">
+          <li
+            v-for="row in pieceDraws"
+            :key="row.id"
+            class="draw-item"
+            :class="{ 'is-rejected': row.state === '已退回', 'is-migrated': row.migrated === true }"
+          >
+            <span class="draw-seq">#{{ row.seq }}</span>
+            <div class="draw-main">
+              <div class="draw-title">
+                <b>{{ row.batchColorCode }}</b>
+                <el-tag size="small" type="info" effect="plain">第 {{ row.batchCycle }} 轮快照</el-tag>
+                <el-tag size="small" :type="row.state === '已落账' ? 'success' : 'danger'" effect="dark">
+                  {{ row.state === '已落账' ? '已落账' : `已退回 · ${row.rejectReason}` }}
+                </el-tag>
+                <el-tag v-if="row.migrated" size="small" type="warning" effect="plain">旧数据回填</el-tag>
+              </div>
+              <div class="draw-sub">
+                取料 <b>{{ row.drawKg }} kg</b> · 操作人 {{ row.operator || '—' }} · 落账时配方：{{ row.batchRecipe || '—' }}
+              </div>
+              <div v-if="row.state === '已退回'" class="draw-reject">
+                {{ row.rejectReason === '批次不存在' ? '该批次已不存在（删除或换批）' : `当时余量仅 ${row.remainAtReject} kg，不足 ${row.drawKg} kg（可能他人先取走）` }}
+                · 批次与别人的取料未改动
+              </div>
+            </div>
+            <div class="draw-actions">
+              <template v-if="row.state === '已退回'">
+                <el-button size="small" type="danger" @click="openRetryDraw(row)">改批次/用量后重试</el-button>
+                <el-button size="small" type="primary" plain @click="quickRetryDraw(row)">按本侧重试</el-button>
+                <el-button size="small" text @click="discardDraw(row)">撤销</el-button>
+              </template>
             </div>
           </li>
         </ul>
@@ -374,6 +632,52 @@ function goAnnealing(): void {
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="drawDialog"
+      :title="editingDrawId === null ? '记取料道次（技师账）' : '重试取料道次（仅技师侧）'"
+      width="560px"
+    >
+      <el-form ref="drawFormRef" :model="drawForm" :rules="drawRules" label-width="110px">
+        <el-row :gutter="12">
+          <el-col :span="10">
+            <el-form-item label="取料道次" prop="seq">
+              <el-input-number v-model="drawForm.seq" :min="1" :max="99" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="14">
+            <el-form-item label="操作人" prop="operator">
+              <el-input v-model="drawForm.operator" placeholder="如：林曦" />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="料液批次" prop="batchId">
+          <el-select v-model="drawForm.batchId" filterable style="width: 100%" placeholder="选择用哪批料">
+            <el-option v-for="item in drawBatchOptions" :key="item.id" :value="item.id" :label="item.label" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="取料量（kg）" prop="drawKg">
+          <el-input-number v-model="drawForm.drawKg" :min="0.1" :max="500" :step="0.1" :precision="1" style="width: 100%" />
+        </el-form-item>
+        <el-alert
+          :type="drawForm.drawKg > selectedBatchRemain ? 'error' : 'success'"
+          show-icon
+          :closable="false"
+          :title="
+            drawForm.drawKg > selectedBatchRemain
+              ? `该批次当前余量仅 ${selectedBatchRemain} kg，现在提交将只退回本道次并写明「余量不足」，不会扣穿批次、不影响别人。`
+              : `该批次当前余量 ${selectedBatchRemain} kg，足够本次取料；保存时按落账当时余量最终判定。`
+          "
+          :description="editingDrawId === null ? '' : '重试只会重新提交技师这一条取料道次，熔化车间侧其它记录与别人的取料不动。'"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="drawDialog = false">取消</el-button>
+        <el-button :type="editingDrawId === null ? 'primary' : 'danger'" :loading="drawSubmitting" @click="submitDraw">
+          {{ editingDrawId === null ? '保存取料' : '本侧重试' }}
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -471,6 +775,79 @@ function goAnnealing(): void {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.draw-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.draw-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid #e4e7ed;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.draw-item.is-rejected {
+  border-color: #f56c6c;
+  background: #fef0f0;
+}
+
+.draw-item.is-migrated {
+  border-style: dashed;
+}
+
+.draw-seq {
+  display: grid;
+  place-items: center;
+  min-width: 42px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 14px;
+  background: #f2f4f7;
+  font-size: 12px;
+  font-weight: 600;
+  color: #5b6b7a;
+}
+
+.draw-main {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.draw-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.draw-sub {
+  font-size: 12px;
+  color: #5b6b7a;
+}
+
+.draw-reject {
+  font-size: 12px;
+  color: #c0392b;
+}
+
+.draw-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   flex-wrap: wrap;
 }
 

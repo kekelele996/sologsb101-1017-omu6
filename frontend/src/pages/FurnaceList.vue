@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * /furnaces 窑炉与料液台账
- * 新建窑炉、登记料液批次与剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
- * 消费模型：Furnace、GlassBatch；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
+ * /furnaces 窑炉与料液台账（熔化车间那本账）
+ * 批次上记投料量、配方、出料量与余量；出料只由技师落账取料道次时按当时余量扣减。
+ * 支持回炉重熔 / 改配方（技师账旧道次不动）、本侧落账失败只按本侧重试，并按料液批次与技师账对账。
+ * 消费模型：Furnace、GlassBatch、Draw；复用组件：<StageTag>、<EmptyPanel>、<FilterBar>、<StatBadge>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
@@ -22,22 +23,26 @@ import {
   type FurnaceType,
 } from '@/types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '@/types/batch'
+import type { Draw } from '@/types/draw'
 import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
+import { reconcileLedgers, type BatchReconcileRow } from '@/utils/reconcile'
 
 const store = useFurnaceStore()
 
 const furnaceDialog = ref(false)
 const batchDialog = ref(false)
-const consumeDialog = ref(false)
+const remeltDialog = ref(false)
+const recipeDialog = ref(false)
 const submitting = ref(false)
 const editingFurnaceId = ref<string | null>(null)
 const editingBatchId = ref<string | null>(null)
-const consumeTarget = ref<GlassBatch | null>(null)
-const consumeKg = ref(5)
+const remeltTarget = ref<GlassBatch | null>(null)
+const recipeTarget = ref<GlassBatch | null>(null)
 const refillKg = ref(50)
 const furnaceFormRef = ref<FormInstance>()
 const batchFormRef = ref<FormInstance>()
+const remeltFormRef = ref<FormInstance>()
 const selectedFurnaceId = ref<string>('all')
 
 const furnaceForm = reactive<FurnaceDraft>({
@@ -54,8 +59,11 @@ const batchForm = reactive<GlassBatchDraft>({
   recipe: '',
   meltDate: today(),
   tempC: 1150,
-  remainKg: 200,
+  chargeKg: 200,
 })
+
+const remeltForm = reactive({ recipe: '', chargeKg: 200, meltDate: today(), tempC: 1150 })
+const recipeForm = reactive({ recipe: '' })
 
 const furnaceRules: FormRules<FurnaceDraft> = {
   code: [{ required: true, message: '请填写窑号', trigger: 'blur' }],
@@ -71,7 +79,13 @@ const batchRules: FormRules<GlassBatchDraft> = {
   recipe: [{ required: true, message: '请填写配方', trigger: 'blur' }],
   meltDate: [{ required: true, message: '请选择熔化日期', trigger: 'change' }],
   tempC: [{ required: true, message: '请填写出料温度', trigger: 'blur' }],
-  remainKg: [{ required: true, message: '请填写剩余量', trigger: 'blur' }],
+  chargeKg: [{ required: true, message: '请填写投料量', trigger: 'blur' }],
+}
+
+const remeltRules: FormRules<typeof remeltForm> = {
+  recipe: [{ required: true, message: '请填写本轮配方', trigger: 'blur' }],
+  chargeKg: [{ required: true, message: '请填写本轮投料量', trigger: 'blur' }],
+  meltDate: [{ required: true, message: '请选择重熔日期', trigger: 'change' }],
 }
 
 const batches = computed<GlassBatch[]>(() =>
@@ -84,7 +98,14 @@ const furnaceLabel = computed<Record<string, string>>(() =>
   Object.fromEntries(store.furnaces.map((row) => [row.id, `${row.code} · ${row.type}`]))
 )
 
+/** 按料液批次对账：熔化车间账（投料/出料/余量）↔ 技师账（已落账取料合计） */
+const reconcile = computed(() => reconcileLedgers(batches.value, store.draws))
+
+const reconcileRowsById = computed(() => new Map(reconcile.value.rows.map((row) => [row.batchId, row])))
+
 const totals = computed(() => ({
+  totalCharge: Math.round(store.batches.reduce((acc, row) => acc + row.chargeKg, 0) * 10) / 10,
+  totalOut: Math.round(store.batches.reduce((acc, row) => acc + row.outKg, 0) * 10) / 10,
   totalRemain: Math.round(store.batches.reduce((acc, row) => acc + row.remainKg, 0) * 10) / 10,
   lowCount: store.lowRemainBatches.length,
   runningCount: store.furnaces.filter((row) => row.state === '运行').length,
@@ -95,6 +116,8 @@ const totals = computed(() => ({
 onMounted(() => {
   void store.loadAll()
 })
+
+/* ------------------------------ 窑炉 ------------------------------ */
 
 function openCreateFurnace(): void {
   editingFurnaceId.value = null
@@ -110,13 +133,7 @@ function openCreateFurnace(): void {
 
 function openEditFurnace(row: Furnace): void {
   editingFurnaceId.value = row.id
-  Object.assign(furnaceForm, {
-    code: row.code,
-    type: row.type,
-    maxTempC: row.maxTempC,
-    fuelType: row.fuelType,
-    state: row.state,
-  })
+  Object.assign(furnaceForm, { code: row.code, type: row.type, maxTempC: row.maxTempC, fuelType: row.fuelType, state: row.state })
   furnaceDialog.value = true
 }
 
@@ -127,13 +144,27 @@ async function submitFurnace(): Promise<void> {
   submitting.value = true
   try {
     if (editingFurnaceId.value === null) {
-      await store.createFurnace({ ...furnaceForm })
-      ElMessage.success('窑炉已登记')
+      const draft = { ...furnaceForm }
+      const ok = await store.runSide('create-furnace', `新建窑炉 ${draft.code}`, { draft }, () => store.createFurnace(draft))
+      if (ok) {
+        ElMessage.success('窑炉已登记')
+        furnaceDialog.value = false
+      } else {
+        ElMessage.warning('熔化车间侧保存失败，已挂本侧重试队列（技师侧不动）')
+      }
     } else {
-      await store.updateFurnace(editingFurnaceId.value, { ...furnaceForm })
-      ElMessage.success('窑炉信息已更新')
+      const id = editingFurnaceId.value
+      const draft = { ...furnaceForm }
+      const ok = await store.runSide('edit-furnace', `编辑窑炉 ${draft.code}`, { furnaceId: id, draft }, () =>
+        store.updateFurnace(id, draft),
+      )
+      if (ok) {
+        ElMessage.success('窑炉信息已更新')
+        furnaceDialog.value = false
+      } else {
+        ElMessage.warning('熔化车间侧保存失败，已挂本侧重试队列（技师侧不动）')
+      }
     }
-    furnaceDialog.value = false
   } finally {
     submitting.value = false
   }
@@ -141,7 +172,7 @@ async function submitFurnace(): Promise<void> {
 
 async function deleteFurnace(row: Furnace): Promise<void> {
   try {
-    await ElMessageBox.confirm(`将删除「${row.code}」及其全部料液批次，且不可恢复。`, '确认删除窑炉？', {
+    await ElMessageBox.confirm(`将删除「${row.code}」及其全部料液批次，且不可恢复。技师历史取料道次保留并标批次缺失。`, '确认删除窑炉？', {
       type: 'warning',
       confirmButtonText: '删除',
       cancelButtonText: '取消',
@@ -153,6 +184,8 @@ async function deleteFurnace(row: Furnace): Promise<void> {
   ElMessage.success('窑炉已删除')
 }
 
+/* ------------------------------ 料液批次 ------------------------------ */
+
 function openCreateBatch(): void {
   editingBatchId.value = null
   Object.assign(batchForm, {
@@ -161,7 +194,7 @@ function openCreateBatch(): void {
     recipe: '',
     meltDate: today(),
     tempC: 1150,
-    remainKg: 200,
+    chargeKg: 200,
   })
   batchDialog.value = true
 }
@@ -174,7 +207,7 @@ function openEditBatch(row: GlassBatch): void {
     recipe: row.recipe,
     meltDate: row.meltDate,
     tempC: row.tempC,
-    remainKg: row.remainKg,
+    chargeKg: row.chargeKg,
   })
   batchDialog.value = true
 }
@@ -186,13 +219,29 @@ async function submitBatch(): Promise<void> {
   submitting.value = true
   try {
     if (editingBatchId.value === null) {
-      await store.createBatch({ ...batchForm })
-      ElMessage.success('料液批次已登记')
+      const draft = { ...batchForm }
+      const ok = await store.runSide('create-batch', `登记料液批次 ${draft.colorCode}`, { batchDraft: draft }, () =>
+        store.createBatch(draft),
+      )
+      if (ok) {
+        ElMessage.success('料液批次已登记（投料量即初始余量，出料量为 0）')
+        batchDialog.value = false
+      } else {
+        ElMessage.warning('熔化车间侧登记失败，已挂本侧重试队列（技师侧不动）')
+      }
     } else {
-      await store.updateBatch(editingBatchId.value, { ...batchForm })
-      ElMessage.success('料液批次已更新')
+      const id = editingBatchId.value
+      const draft = { ...batchForm }
+      const ok = await store.runSide('edit-batch', `编辑批次 ${draft.colorCode}`, { batchId: id, batchDraft: draft }, () =>
+        store.updateBatchMeta(id, draft),
+      )
+      if (ok) {
+        ElMessage.success('料液批次基础信息已更新（投料 / 出料 / 余量请走补料或回炉重熔）')
+        batchDialog.value = false
+      } else {
+        ElMessage.warning('熔化车间侧保存失败，已挂本侧重试队列（技师侧不动）')
+      }
     }
-    batchDialog.value = false
   } finally {
     submitting.value = false
   }
@@ -200,11 +249,11 @@ async function submitBatch(): Promise<void> {
 
 async function deleteBatch(row: GlassBatch): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认删除料液批次「${row.colorCode}」？`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
+    await ElMessageBox.confirm(
+      `确认从熔化车间账删除料液批次「${row.colorCode}」？技师侧取料道次不会删除，将在对账中标为「批次缺失」。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
   } catch {
     return
   }
@@ -212,35 +261,112 @@ async function deleteBatch(row: GlassBatch): Promise<void> {
   ElMessage.success('料液批次已删除')
 }
 
-function openConsume(row: GlassBatch): void {
-  consumeTarget.value = row
-  consumeKg.value = Math.min(10, row.remainKg)
-  consumeDialog.value = true
-}
-
-async function submitConsume(): Promise<void> {
-  const target = consumeTarget.value
-  if (target === null) return
-  const actual = await store.consume(target.id, consumeKg.value)
-  ElMessage.success(`已取料 ${actual} kg`)
-  if (isLowRemain(target.remainKg - actual)) {
-    ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`, )
-  }
-  consumeDialog.value = false
-}
-
 async function submitRefill(row: GlassBatch): Promise<void> {
-  await store.refill(row.id, refillKg.value)
-  ElMessage.success(`已补料 ${refillKg.value} kg`)
+  const kg = refillKg.value
+  const ok = await store.runSide('refill', `${row.colorCode} 补料 ${kg} kg`, { batchId: row.id, kg }, () => store.refill(row.id, kg))
+  ElMessage[ok ? 'success' : 'warning'](ok ? store.lastMessage : '补料落账失败，已挂本侧重试队列')
+}
+
+/* ------------------------------ 回炉重熔 / 改配方 ------------------------------ */
+
+function openRemelt(row: GlassBatch): void {
+  remeltTarget.value = row
+  Object.assign(remeltForm, { recipe: row.recipe, chargeKg: Math.max(100, Math.ceil(row.chargeKg)), meltDate: today(), tempC: row.tempC })
+  remeltDialog.value = true
+}
+
+async function submitRemelt(): Promise<void> {
+  if (remeltFormRef.value === undefined || remeltTarget.value === null) return
+  const valid = await remeltFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  const target = remeltTarget.value
+  try {
+    await ElMessageBox.confirm(
+      `「${target.colorCode}」将回炉重熔：开第 ${target.cycle + 1} 轮、出料量清零、余量恢复为投料量 ${remeltForm.chargeKg} kg。技师账第 ${target.cycle} 轮及之前的取料道次照旧保留。`,
+      '确认回炉重熔？',
+      { type: 'warning', confirmButtonText: '确认重熔', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  submitting.value = true
+  try {
+    const payload = { ...remeltForm }
+    const ok = await store.runSide('remelt', `${target.colorCode} 回炉重熔`, { batchId: target.id, ...payload }, () =>
+      store.remelt(target.id, payload),
+    )
+    if (ok) {
+      ElMessage.success(store.lastMessage)
+      remeltDialog.value = false
+    } else {
+      ElMessage.warning('回炉重熔落账失败，已挂本侧重试队列（技师侧不动）')
+    }
+  } finally {
+    submitting.value = false
+  }
+}
+
+function openRecipe(row: GlassBatch): void {
+  recipeTarget.value = row
+  recipeForm.recipe = row.recipe
+  recipeDialog.value = true
+}
+
+async function submitRecipe(): Promise<void> {
+  if (recipeTarget.value === null) return
+  const target = recipeTarget.value
+  const recipe = recipeForm.recipe.trim()
+  if (recipe === '') {
+    ElMessage.warning('配方不能为空')
+    return
+  }
+  const ok = await store.runSide('recipe', `${target.colorCode} 改配方`, { batchId: target.id, recipe }, () =>
+    store.changeRecipe(target.id, recipe),
+  )
+  if (ok) {
+    ElMessage.success(store.lastMessage)
+    recipeDialog.value = false
+  } else {
+    ElMessage.warning('改配方落账失败，已挂本侧重试队列（技师侧不动）')
+  }
+}
+
+/* ------------------------------ 本侧重试 ------------------------------ */
+
+async function retryPending(id: string): Promise<void> {
+  const ok = await store.retryPendingOp(id)
+  ElMessage[ok ? 'success' : 'warning'](ok ? '本侧重试成功，已移出重试队列' : '重试仍失败，保留在本侧队列')
+}
+
+function dismissPending(id: string): void {
+  store.dropPendingOp(id)
 }
 
 function batchRowClass({ row }: { row: GlassBatch }): string {
+  const report = reconcileRowsById.value.get(row.id)
+  if (report !== undefined && !report.balanced) return 'row-diff'
   return isLowRemain(row.remainKg) ? 'row-low-remain' : ''
+}
+
+function reconcileRowClass({ row }: { row: BatchReconcileRow }): string {
+  return row.balanced ? '' : 'row-diff'
+}
+
+function orphanDrawText(group: { draws: Draw[] }): string {
+  return group.draws
+    .map((d) => `${d.pieceName}#${d.seq}(${d.state === '已落账' ? `${d.drawKg}kg` : '已退回'})`)
+    .join('，')
 }
 
 function handleFurnaceFilter(key: string, value: string): void {
   if (key === 'type') store.setFilters({ type: value as FurnaceType | 'all' })
   if (key === 'state') store.setFilters({ state: value as FurnaceState | 'all' })
+}
+
+function diffTagType(row: GlassBatch): 'success' | 'danger' | 'warning' | 'info' {
+  const report = reconcileRowsById.value.get(row.id)
+  if (report === undefined || report.balanced) return 'success'
+  return report.migrated ? 'warning' : 'danger'
 }
 </script>
 
@@ -250,18 +376,40 @@ function handleFurnaceFilter(key: string, value: string): void {
       <StatBadge label="窑炉总数" :value="store.furnaces.length" suffix="台" tone="primary" icon="Histogram" />
       <StatBadge label="熔化/坩埚炉" :value="totals.meltFurnaces" suffix="台" tone="warning" icon="DataLine" />
       <StatBadge label="退火窑" :value="totals.annealFurnaces" suffix="台" tone="info" icon="Histogram" />
-      <StatBadge label="运行中" :value="totals.runningCount" suffix="台" tone="success" icon="TrendCharts" />
       <StatBadge label="料液批次" :value="store.batches.length" suffix="批" tone="primary" icon="PieChart" />
-      <StatBadge label="剩余总量" :value="totals.totalRemain" suffix="kg" tone="info" icon="TrendCharts" />
+      <StatBadge label="投料总量" :value="totals.totalCharge" suffix="kg" tone="info" icon="Coin" />
+      <StatBadge label="出料累计" :value="totals.totalOut" suffix="kg" tone="warning" icon="DataLine" />
+      <StatBadge label="剩余总量" :value="totals.totalRemain" suffix="kg" tone="success" icon="TrendCharts" />
       <StatBadge
-        label="低于补料阈值"
-        :value="totals.lowCount"
+        label="对账有差"
+        :value="reconcile.diffCount"
         suffix="批"
-        :tone="totals.lowCount > 0 ? 'danger' : 'success'"
+        :tone="reconcile.diffCount > 0 ? 'danger' : 'success'"
         icon="Warning"
-        :hint="`剩余量低于 ${LOW_REMAIN_KG} kg 的料液批次数量`"
+        hint="技师已落账取料合计与车间出料量 / 余量对不上的批次数"
       />
     </div>
+
+    <el-alert
+      v-if="store.pendingOps.length > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`熔化车间侧有 ${store.pendingOps.length} 条落账失败待办，只在本侧重试，技师侧不动`"
+    >
+      <template #default>
+        <div class="pending-list">
+          <div v-for="op in store.pendingOps" :key="op.id" class="pending-item">
+            <span>{{ op.label }}（{{ op.lastError }}）</span>
+            <el-space>
+              <el-button size="small" type="primary" @click="retryPending(op.id)">按本侧重试</el-button>
+              <el-button size="small" text @click="dismissPending(op.id)">移除</el-button>
+            </el-space>
+          </div>
+        </div>
+      </template>
+    </el-alert>
 
     <el-alert
       v-if="store.lowRemainBatches.length > 0"
@@ -274,8 +422,8 @@ function handleFurnaceFilter(key: string, value: string): void {
       <template #default>
         <div class="low-list">
           <div v-for="row in store.lowRemainBatches" :key="row.id">
-            {{ row.colorCode }}（{{ furnaceLabel[row.furnaceId] ?? '未知窑炉' }}）剩余
-            <b>{{ row.remainKg }} kg</b> —— {{ row.recipe }}
+            {{ row.colorCode }}（{{ furnaceLabel[row.furnaceId] ?? '未知窑炉' }}）· 第 {{ row.cycle }} 轮 ·
+            投料 {{ row.chargeKg }} / 出料 {{ row.outKg }} / 剩余 <b>{{ row.remainKg }} kg</b>
           </div>
         </div>
       </template>
@@ -333,23 +481,21 @@ function handleFurnaceFilter(key: string, value: string): void {
         <el-table-column label="最高温度" width="110" align="right">
           <template #default="{ row }">{{ row.maxTempC }} ℃</template>
         </el-table-column>
-        <el-table-column label="料液批次" width="110" align="right">
+        <el-table-column label="料液批次" width="100" align="right">
           <template #default="{ row }">{{ store.statOf(row.id).batchCount }} 批</template>
         </el-table-column>
-        <el-table-column label="剩余合计" width="120" align="right">
-          <template #default="{ row }">{{ store.statOf(row.id).totalRemainKg }} kg</template>
-        </el-table-column>
-        <el-table-column label="关联作品" width="110" align="right">
-          <template #default="{ row }">{{ store.statOf(row.id).pieceCount }} 件</template>
-        </el-table-column>
-        <el-table-column label="低于阈值" width="110" align="right">
+        <el-table-column label="投料 / 出料" width="150" align="right">
           <template #default="{ row }">
-            <span :class="{ 'cell-warn': store.statOf(row.id).lowCount > 0 }">
-              {{ store.statOf(row.id).lowCount }} 批
-            </span>
+            <span class="cell-sub">{{ store.statOf(row.id).totalChargeKg }} / {{ store.statOf(row.id).totalOutKg }} kg</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="剩余合计" width="110" align="right">
+          <template #default="{ row }">{{ store.statOf(row.id).totalRemainKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="关联作品" width="100" align="right">
+          <template #default="{ row }">{{ store.statOf(row.id).pieceCount }} 件</template>
+        </el-table-column>
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openEditFurnace(row)">编辑</el-button>
             <el-button link type="primary" size="small" @click="openCreateBatch">挂料液</el-button>
@@ -362,16 +508,11 @@ function handleFurnaceFilter(key: string, value: string): void {
     <el-card shadow="never" class="mt-14">
       <template #header>
         <div class="card-header">
-          <span class="card-header__title">料液批次与剩余量</span>
+          <span class="card-header__title">熔化车间账 · 料液批次（投料量 / 配方 / 出料量 / 余量）</span>
           <el-space>
-            <el-select v-model="selectedFurnaceId" style="width: 200px" size="small">
+            <el-select v-model="selectedFurnaceId" style="width: 190px" size="small">
               <el-option value="all" label="全部窑炉" />
-              <el-option
-                v-for="item in store.furnaces"
-                :key="item.id"
-                :value="item.id"
-                :label="`${item.code} · ${item.type}`"
-              />
+              <el-option v-for="item in store.furnaces" :key="item.id" :value="item.id" :label="`${item.code} · ${item.type}`" />
             </el-select>
             <el-button type="primary" @click="openCreateBatch" :disabled="store.meltingFurnaces.length === 0">
               <el-icon><Plus /></el-icon>
@@ -384,57 +525,168 @@ function handleFurnaceFilter(key: string, value: string): void {
       <EmptyPanel
         v-if="store.batches.length === 0 && !store.loading"
         title="还没有料液批次"
-        description="为熔化炉或坩埚炉登记色号、配方、熔化日期与剩余量；取料时会自动按剩余量扣减，低于阈值会高亮提示补料。"
+        description="熔化车间按批次登记投料量与配方；技师在工序页落账取料道次时按当时余量扣减出料，这里只记账不直接取料。"
         action-text="登记第一批料液"
         @action="openCreateBatch"
       />
 
-      <el-table
-        v-else
-        v-loading="store.loading"
-        :data="batches"
-        row-key="id"
-        stripe
-        :row-class-name="batchRowClass"
-      >
+      <el-table v-else v-loading="store.loading" :data="batches" row-key="id" stripe :row-class-name="batchRowClass">
         <el-table-column label="色号 / 配方" min-width="260">
           <template #default="{ row }">
             <div class="cell-stack">
               <span class="cell-strong">{{ row.colorCode }}</span>
               <span class="cell-sub">{{ row.recipe }}</span>
+              <el-space :size="4">
+                <el-tag size="small" type="info" effect="plain">第 {{ row.cycle }} 轮</el-tag>
+                <el-tag size="small" type="info" effect="plain">版本 v{{ row.version }}</el-tag>
+                <el-tag v-if="row.migrated" size="small" type="warning" effect="plain">历史迁移</el-tag>
+              </el-space>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="所属窑炉" min-width="170">
+        <el-table-column label="所属窑炉" min-width="150">
           <template #default="{ row }">{{ furnaceLabel[row.furnaceId] ?? '（窑炉已删除）' }}</template>
         </el-table-column>
-        <el-table-column prop="meltDate" label="熔化日期" width="120" />
-        <el-table-column label="出料温度" width="110" align="right">
+        <el-table-column prop="meltDate" label="熔化日期" width="110" />
+        <el-table-column label="出料温度" width="100" align="right">
           <template #default="{ row }">{{ row.tempC }} ℃</template>
         </el-table-column>
-        <el-table-column label="剩余量" width="130" align="right">
+        <el-table-column label="投料量" width="100" align="right">
+          <template #default="{ row }">{{ row.chargeKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="出料量" width="100" align="right">
           <template #default="{ row }">
-            <el-tag :type="isLowRemain(row.remainKg) ? 'danger' : 'success'" size="small">
-              {{ row.remainKg }} kg
+            <span :class="{ 'cell-warn': (reconcileRowsById.get(row.id)?.ledgerDiffKg ?? 0) !== 0 }">{{ row.outKg }} kg</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="余量" width="120" align="right">
+          <template #default="{ row }">
+            <el-tag :type="isLowRemain(row.remainKg) ? 'danger' : 'success'" size="small">{{ row.remainKg }} kg</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账" width="120">
+          <template #default="{ row }">
+            <el-tag :type="diffTagType(row)" size="small">
+              {{ (reconcileRowsById.get(row.id)?.balanced ?? true) ? '对平' : '有差' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="取料 / 补料" width="300">
+        <el-table-column label="熔化车间操作" width="330" fixed="right">
           <template #default="{ row }">
-            <el-space>
-              <el-button size="small" type="primary" plain @click="openConsume(row)">取料</el-button>
-              <el-input-number v-model="refillKg" :min="1" :max="2000" :step="10" size="small" style="width: 110px" />
+            <el-space :size="4" wrap>
+              <el-input-number v-model="refillKg" :min="1" :max="2000" :step="10" size="small" style="width: 105px" />
               <el-button size="small" @click="submitRefill(row)">补料</el-button>
+              <el-button size="small" type="warning" plain @click="openRemelt(row)">回炉重熔</el-button>
+              <el-button size="small" type="primary" link @click="openRecipe(row)">改配方</el-button>
+              <el-button size="small" type="primary" link @click="openEditBatch(row)">编辑</el-button>
+              <el-button size="small" type="danger" link @click="deleteBatch(row)">删除</el-button>
             </el-space>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+      </el-table>
+    </el-card>
+
+    <!-- 按料液批次对账 -->
+    <el-card shadow="never" class="mt-14">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">两本账对账（按料液批次）</span>
+          <el-space>
+            <el-tag :type="reconcile.balanced ? 'success' : 'danger'" effect="dark" size="large">
+              {{ reconcile.balanced ? '全部对平' : `${reconcile.diffCount} 批有差 · ${reconcile.orphanCount} 道批次缺失` }}
+            </el-tag>
+          </el-space>
+        </div>
+      </template>
+
+      <el-alert
+        type="info"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="对账口径：技师「已落账」取料量之和 = 批次出料量；投料量 - 出料量 = 批次余量。被退回的取料道次不计入出料量。"
+      />
+
+      <el-table :data="reconcile.rows" row-key="batchId" stripe :row-class-name="reconcileRowClass">
+        <el-table-column label="色号 / 轮次" min-width="200">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" @click="openEditBatch(row)">编辑</el-button>
-            <el-button link type="danger" size="small" @click="deleteBatch(row)">删除</el-button>
+            <div class="cell-stack">
+              <span class="cell-strong">{{ row.colorCode }}</span>
+              <span class="cell-sub">{{ row.recipe }}</span>
+              <el-space :size="4">
+                <el-tag size="small" type="info" effect="plain">第 {{ row.cycle }} 轮</el-tag>
+                <el-tag v-if="row.migrated" size="small" type="warning" effect="plain">历史迁移</el-tag>
+              </el-space>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="车间投料" width="100" align="right">
+          <template #default="{ row }">{{ row.chargeKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="车间出料" width="100" align="right">
+          <template #default="{ row }">{{ row.outKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="车间余量" width="100" align="right">
+          <template #default="{ row }">{{ row.remainKg }} kg</template>
+        </el-table-column>
+        <el-table-column label="技师本轮取料" width="140" align="right">
+          <template #default="{ row }">
+            <span :class="{ 'cell-warn': !row.balanced && row.diffSide !== 'melt' }">{{ row.techDrawKg }} kg</span>
+            <span class="cell-sub"> · {{ row.techDrawCount }} 道</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="历史轮次取料" width="130" align="right">
+          <template #default="{ row }">
+            <span class="cell-sub">{{ row.techHistoryKg }} kg · {{ row.techHistoryCount }} 道（照旧）</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="取料账差" width="110" align="right">
+          <template #default="{ row }">
+            <el-tag size="small" :type="Math.abs(row.ledgerDiffKg) > 0.05 ? 'danger' : 'success'">
+              {{ row.ledgerDiffKg > 0 ? '+' : '' }}{{ row.ledgerDiffKg }} kg
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="余量差" width="110" align="right">
+          <template #default="{ row }">
+            <el-tag size="small" :type="Math.abs(row.remainDiffKg) > 0.05 ? 'danger' : 'success'">
+              {{ row.remainDiffKg > 0 ? '+' : '' }}{{ row.remainDiffKg }} kg
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="退回道次" width="90" align="right">
+          <template #default="{ row }">
+            <el-badge v-if="row.rejectedCount > 0" :value="row.rejectedCount" type="warning" />
+            <span v-else class="cell-sub">0</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="差异说明（差在哪批）" min-width="320">
+          <template #default="{ row }">
+            <span v-if="row.balanced" class="cell-ok">两本账对平</span>
+            <ul v-else class="issue-list">
+              <li v-for="(issue, i) in row.issues" :key="i">{{ issue }}</li>
+            </ul>
           </template>
         </el-table-column>
       </el-table>
+
+      <template v-if="reconcile.orphans.length > 0">
+        <el-divider content-position="left">技师账引用了已删除 / 缺失的批次</el-divider>
+        <el-table :data="reconcile.orphans" row-key="batchId" stripe class="row-diff-table">
+          <el-table-column prop="batchId" label="缺失批次 id" min-width="220" />
+          <el-table-column label="取料道次" width="110" align="right">
+            <template #default="{ row }">{{ row.count }} 道</template>
+          </el-table-column>
+          <el-table-column label="已落账用量" width="120" align="right">
+            <template #default="{ row }">{{ row.totalKg }} kg</template>
+          </el-table-column>
+          <el-table-column label="涉及取料道次" min-width="360">
+            <template #default="{ row }">
+              <span class="cell-sub">{{ orphanDrawText(row) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
     </el-card>
 
     <el-dialog v-model="furnaceDialog" :title="editingFurnaceId === null ? '新建窑炉' : '编辑窑炉'" width="580px">
@@ -486,7 +738,7 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="batchDialog" :title="editingBatchId === null ? '登记料液批次' : '编辑料液批次'" width="620px">
+    <el-dialog v-model="batchDialog" :title="editingBatchId === null ? '登记料液批次（熔化车间账）' : '编辑料液批次基础信息'" width="620px">
       <el-form ref="batchFormRef" :model="batchForm" :rules="batchRules" label-width="120px">
         <el-form-item label="所属窑炉" prop="furnaceId">
           <el-select v-model="batchForm.furnaceId" style="width: 100%">
@@ -520,17 +772,24 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="剩余量（kg）" prop="remainKg">
-              <el-input-number v-model="batchForm.remainKg" :min="0" :max="5000" :step="10" style="width: 100%" />
+            <el-form-item label="投料量（kg）" prop="chargeKg">
+              <el-input-number v-model="batchForm.chargeKg" :min="0" :max="5000" :step="10" style="width: 100%" />
             </el-form-item>
           </el-col>
         </el-row>
         <el-alert
-          v-if="isLowRemain(batchForm.remainKg)"
+          v-if="editingBatchId === null"
+          type="info"
+          show-icon
+          :closable="false"
+          title="新批次：投料量即初始余量，出料量从 0 起；后续余量只由技师落账取料扣减或本侧补料 / 回炉重熔改变。"
+        />
+        <el-alert
+          v-else
           type="warning"
           show-icon
           :closable="false"
-          :title="`剩余量低于补料阈值 ${LOW_REMAIN_KG} kg，保存后会在列表与顶部提醒中高亮。`"
+          title="编辑只改基础信息；改配方请用「改配方」（旧取料道次保留原配方快照），重新配料请用「回炉重熔」。"
         />
       </el-form>
       <template #footer>
@@ -539,19 +798,58 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="consumeDialog" title="取料" width="460px">
-      <p class="dialog-tip">
-        {{ consumeTarget?.colorCode }} 当前剩余
-        <b>{{ consumeTarget?.remainKg }} kg</b>，取料后按剩余量扣减；不足时扣到 0。
-      </p>
-      <el-form label-width="110px">
-        <el-form-item label="取料量（kg）">
-          <el-input-number v-model="consumeKg" :min="0.5" :max="consumeTarget?.remainKg ?? 100" :step="0.5" style="width: 100%" />
+    <el-dialog v-model="remeltDialog" title="回炉重熔（开新一轮）" width="560px">
+      <el-form ref="remeltFormRef" :model="remeltForm" :rules="remeltRules" label-width="120px">
+        <el-alert
+          type="warning"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          :title="remeltTarget ? `「${remeltTarget.colorCode}」当前为第 ${remeltTarget.cycle} 轮：出料 ${remeltTarget.outKg} kg / 余量 ${remeltTarget.remainKg} kg；重熔后开第 ${remeltTarget.cycle + 1} 轮。` : ''"
+          description="技师那本账旧轮次的取料道次连同批次快照照旧保留，对账按新轮次的出料量累计。"
+        />
+        <el-form-item label="本轮配方" prop="recipe">
+          <el-input v-model="remeltForm.recipe" type="textarea" :rows="2" />
         </el-form-item>
+        <el-row :gutter="12">
+          <el-col :span="8">
+            <el-form-item label="投料量（kg）" prop="chargeKg">
+              <el-input-number v-model="remeltForm.chargeKg" :min="0" :max="5000" :step="10" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="重熔日期" prop="meltDate">
+              <el-date-picker v-model="remeltForm.meltDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="8">
+            <el-form-item label="出料温度（℃）">
+              <el-input-number v-model="remeltForm.tempC" :min="600" :max="1800" :step="10" style="width: 100%" />
+            </el-form-item>
+          </el-col>
+        </el-row>
       </el-form>
       <template #footer>
-        <el-button @click="consumeDialog = false">取消</el-button>
-        <el-button type="primary" @click="submitConsume">确认取料</el-button>
+        <el-button @click="remeltDialog = false">取消</el-button>
+        <el-button type="warning" :loading="submitting" @click="submitRemelt">确认重熔</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="recipeDialog" :title="`改配方 · ${recipeTarget?.colorCode ?? ''}`" width="520px">
+      <el-form label-width="90px">
+        <el-form-item label="新配方">
+          <el-input v-model="recipeForm.recipe" type="textarea" :rows="3" />
+        </el-form-item>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          title="配方更新后批次版本号 +1；技师已落账取料道次仍保留其落账时的配方快照，不受影响。"
+        />
+      </el-form>
+      <template #footer>
+        <el-button @click="recipeDialog = false">取消</el-button>
+        <el-button type="primary" @click="submitRecipe">保存配方</el-button>
       </template>
     </el-dialog>
   </div>
@@ -600,18 +898,33 @@ function handleFurnaceFilter(key: string, value: string): void {
   font-weight: 600;
 }
 
-.low-list {
+.cell-ok {
+  color: #1f8a4c;
+  font-size: 12px;
+}
+
+.issue-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  color: #c0392b;
+  line-height: 1.7;
+}
+
+.low-list,
+.pending-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
   font-size: 12px;
   line-height: 1.8;
 }
 
-.dialog-tip {
-  margin: 0 0 12px;
-  font-size: 13px;
-  color: #5b6b7a;
+.pending-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .mt-14 {
@@ -620,5 +933,13 @@ function handleFurnaceFilter(key: string, value: string): void {
 
 .mb-14 {
   margin-bottom: 14px;
+}
+
+:deep(.row-low-remain td) {
+  background-color: #fff7f2 !important;
+}
+
+:deep(.row-diff td) {
+  background-color: #fef0f0 !important;
 }
 </style>

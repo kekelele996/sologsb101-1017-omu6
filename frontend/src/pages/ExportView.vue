@@ -14,8 +14,9 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useDrawStore } from '@/stores/drawStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
-import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
+import { exportDrawsCsvFile, exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { INSPECT_RESULT_OPTIONS, type Inspect, type InspectDraft, type InspectResult } from '@/types/inspect'
 import { today } from '@/utils/id'
@@ -24,6 +25,7 @@ const router = useRouter()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
+const drawStore = useDrawStore()
 
 const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
 
@@ -81,6 +83,8 @@ const stats = computed(() => {
     passPct: total === 0 ? 0 : Math.round((pass / total) * 1000) / 10,
     inProgress: pieceStore.pieces.filter((row) => row.state === '设计中' || row.state === '制作中').length,
     occupancyRate: annealStore.occupancyRate,
+    drawPosted: drawStore.postedDraws.length,
+    drawRejected: drawStore.rejectedDraws.length,
   }
 })
 
@@ -88,6 +92,7 @@ onMounted(() => {
   void pieceStore.loadAll()
   void annealStore.loadAll()
   void furnaceStore.loadAll()
+  void drawStore.loadAll()
 })
 
 function openCreate(): void {
@@ -169,6 +174,11 @@ function handleExportCsv(): void {
   ElMessage.success(`已导出窑务排产汇总 ${filename}`)
 }
 
+function handleExportDrawsCsv(): void {
+  const filename = exportDrawsCsvFile(drawStore.draws, furnaceStore.batches)
+  ElMessage.success(`已导出技师取料道次明细 ${filename}`)
+}
+
 async function handleImport(uploadFile: UploadFile): Promise<void> {
   const raw = uploadFile.raw
   if (raw === undefined) return
@@ -179,19 +189,19 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
     return
   }
   await importSnapshot(result.snapshot)
-  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), drawStore.loadAll()])
   ElMessage.success(`导入成功：${result.message}`)
 }
 
 function handleReset(): void {
   ElMessageBox.confirm(
-    '全部窑炉、料液批次、作品、工序、退火与检验记录都会被清空，并重新灌入演示数据。',
+    '全部窑炉、料液批次、作品、工序、取料道次、退火与检验记录都会被清空，并重新灌入演示数据。',
     '确认重置本地数据？',
     { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
   )
     .then(async () => {
       await resetDatabase()
-      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), drawStore.loadAll()])
       ElMessage.success('已重置为演示数据')
     })
     .catch(() => undefined)
@@ -215,13 +225,15 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         tone="primary"
         icon="PieChart"
       />
+      <StatBadge label="取料道次已落账" :value="stats.drawPosted" suffix="道" tone="success" icon="DataLine" />
+      <StatBadge label="取料道次已退回" :value="stats.drawRejected" suffix="道" tone="danger" icon="Warning" />
       <StatBadge
         label="数据结构版本"
         :value="`v${DB_SCHEMA_VERSION}`"
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 起熔化车间批次与技师取料道次分两本账"
       />
     </div>
 
@@ -255,6 +267,10 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
             <el-button @click="handleExportCsv">
               <el-icon><Download /></el-icon>
               <span>导出 CSV 汇总</span>
+            </el-button>
+            <el-button @click="handleExportDrawsCsv">
+              <el-icon><Download /></el-icon>
+              <span>导出取料道次 CSV</span>
             </el-button>
             <el-upload :auto-upload="false" :show-file-list="false" accept=".json" :on-change="handleImport">
               <el-button>

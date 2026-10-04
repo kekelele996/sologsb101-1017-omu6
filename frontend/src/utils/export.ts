@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { Draw } from '../types/draw'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
@@ -73,7 +74,13 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // draws 为 v3 新增：兼容 v2 旧存档（导入后取料道次为空，可重新登记）
+  if (data.draws !== undefined && !Array.isArray(data.draws)) {
+    return { ok: false, message: '存档的 draws 字段必须是数组。', snapshot: null }
+  }
+  const snapshot = data as DatabaseSnapshot
+  if (!Array.isArray(snapshot.draws)) snapshot.draws = []
+  return { ok: true, message: '存档校验通过。', snapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -151,6 +158,59 @@ export function exportScheduleCsvFile(
 ): string {
   const filename = `玻璃窑务排产汇总-${stampSuffix()}.csv`
   download(filename, buildScheduleCsv(furnaces, batches, pieces, steps, anneals, inspects), 'text/csv;charset=utf-8')
+  return filename
+}
+
+/** 生成技师取料道次明细 CSV（一道次一行，含退回原因与批次快照） */
+export function buildDrawsCsv(draws: Draw[], batches: GlassBatch[]): string {
+  const header = [
+    '作品名',
+    '取料道次',
+    '批次色号',
+    '批次轮次',
+    '落账时配方',
+    '取料量(kg)',
+    '操作人',
+    '状态',
+    '退回原因',
+    '当时余量(kg)',
+    '批次当前余量(kg)',
+    '尝试次数',
+    '旧数据回填',
+  ]
+  const lines: string[] = [header.map(csvCell).join(',')]
+  draws
+    .slice()
+    .sort((a, b) => a.pieceName.localeCompare(b.pieceName, 'zh-Hans-CN') || a.seq - b.seq)
+    .forEach((row) => {
+      const batch = batches.find((item) => item.id === row.batchId)
+      lines.push(
+        [
+          row.pieceName,
+          row.seq,
+          row.batchColorCode,
+          row.batchCycle,
+          row.batchRecipe,
+          row.drawKg,
+          row.operator,
+          row.state,
+          row.rejectReason === '' ? '—' : row.rejectReason,
+          row.remainAtReject,
+          batch?.remainKg ?? '批次缺失',
+          row.attempts,
+          row.migrated === true ? '是' : '否',
+        ]
+          .map(csvCell)
+          .join(','),
+      )
+    })
+  return `﻿${lines.join('\n')}`
+}
+
+/** 导出技师取料道次明细 CSV 文件 */
+export function exportDrawsCsvFile(draws: Draw[], batches: GlassBatch[]): string {
+  const filename = `技师取料道次明细-${stampSuffix()}.csv`
+  download(filename, buildDrawsCsv(draws, batches), 'text/csv;charset=utf-8')
   return filename
 }
 
