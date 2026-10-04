@@ -10,6 +10,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { ReconcileReport } from './reconcile'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
 
@@ -73,7 +74,8 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // v3 起存档含 draws（取料道次）；v2 老存档没有该字段，导入时按空数组处理，不阻断
+  return { ok: true, message: data.draws === undefined ? '存档校验通过（v2 老存档，无取料道次）。' : '存档校验通过。', snapshot: data as DatabaseSnapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -216,4 +218,53 @@ export function buildRefillText(batches: GlassBatch[], furnaces: Furnace[]): str
     lines.push(`· ${row.colorCode}（${furnace?.code ?? '未知窑炉'}）剩余 ${row.remainKg} kg —— ${row.recipe}`)
   })
   return lines.join('\n')
+}
+
+/** 生成两本账对账单 CSV（一批次一行，差异标清在哪批） */
+export function buildReconcileCsv(report: ReconcileReport): string {
+  const header = [
+    '料液色号',
+    '所属窑炉',
+    '批次状态',
+    '熔化账投料(kg)',
+    '熔化账累计出料(kg)',
+    '技师已落账取料合计(kg)',
+    '已落账道次数',
+    '已退回道次数',
+    '余量(kg)',
+    '出料差异(kg)',
+    '结存差异(kg)',
+    '是否轧平',
+    '差异说明',
+  ]
+  const lines: string[] = [header.map(csvCell).join(',')]
+  report.rows.forEach((row) => {
+    lines.push(
+      [
+        row.batch.colorCode,
+        row.furnaceCode,
+        row.batch.state,
+        row.batch.chargeKg,
+        row.batch.outKg,
+        row.drawKg,
+        row.drawCount,
+        row.returnedCount,
+        row.batch.remainKg,
+        row.outDiffKg,
+        row.stockDiffKg,
+        row.balanced ? '轧平' : '对不上',
+        row.issue,
+      ]
+        .map(csvCell)
+        .join(','),
+    )
+  })
+  return `﻿${lines.join('\n')}`
+}
+
+/** 导出两本账对账单 CSV 文件 */
+export function exportReconcileCsvFile(report: ReconcileReport): string {
+  const filename = `料液批次对账单-${stampSuffix()}.csv`
+  download(filename, buildReconcileCsv(report), 'text/csv;charset=utf-8')
+  return filename
 }

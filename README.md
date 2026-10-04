@@ -1,7 +1,10 @@
 # 玻璃吹制工序与退火窑编排台（sologsb101-1017）
 
-面向玻璃工作室的窑务排产员：把每件作品的取料、吹制、塑形、开模、收口逐道工序排定，
-分配退火窑位与温度曲线，出炉检验并归档；窑位冲突时禁止提交，不合格自动生成返工提示。
+面向玻璃工作室的窑务排产员：熔化车间与技师**两本账分立**——熔化车间在料液批次上记投料量、
+配方、累计出料量与余量；技师给每件作品的取料道次记用哪批料、取多少、操作人。取料按批次当时余量
+原子扣减，两终端同时保存时晚到的一条只退回本道并写明余量不足；另有按批次的两账对账页。
+其余工序把取料、吹制、塑形、开模、收口逐道排定，分配退火窑位与温度曲线，出炉检验并归档；
+窑位冲突时禁止提交，不合格自动生成返工提示。
 
 **纯前端单页应用**：无后端、无数据库服务、无 API 调用，数据全部保存在浏览器本地（IndexedDB），
 容器完全无状态、不挂载任何数据卷。
@@ -42,7 +45,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v2` 为 Piece 增加 craft 索引；**`v3` 两本账分立**：batches 增加投料/出料/状态字段、新增 draws 取料道次表，旧取料工序按归属迁移 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -84,9 +87,11 @@ sologsb101-1017/
 
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
-| `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
+| `/furnaces` | `pages/FurnaceList.vue` | **熔化车间账**：新建/编辑/级联删除窑炉、登记料液批次（投料量、配方、出料量、余量）、补料、改配方、回炉重熔（旧批封账、余量转新批）；低于阈值高亮提示补料 |
+| `/draws` | `pages/DrawLedger.vue` | **技师取料账**：每件作品的取料道次记批次/取量/操作人/时间；保存时按当时余量原子扣减，余量不足只退回本道；退回道次只按技师本侧重试 |
+| `/reconcile` | `pages/ReconcileBoard.vue` | **两本账对账**：按批次核对「熔化账累计出料 vs 技师已落账取料合计」「投料−出料−余量」，标清差在哪批；退回道次与无批次孤儿道次单列；导出对账单 CSV |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
-| `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
+| `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位；页内附本作品取料道次卡 |
 | `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
@@ -100,34 +105,39 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
-  * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
-    * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
-    * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
-    * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
-    * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段（详见升级函数）；
+  * `db.version(3)`：**两本账分立**——
+    * `batches` 增加 `chargeKg` 投料量、`outKg` 累计出料量、`state`（在用/已回炉）、`remeltedFrom` 回炉来源索引；
+    * 新增 `draws`（取料道次）表：`[pieceId+drawSeq]` 复合索引与 `batchId / state / stepId` 索引；
+    * `.upgrade()` 中把旧版「取料」工序**按归属迁移**为技师取料道次：缺批次按作品挂的 `batchId` 回填，
+      缺用量先从备注「约 6.2 kg」解析、再缺回填默认 `2.5 kg`；批次 `outKg` 按迁移道次之和回填、
+      `chargeKg = outKg + remainKg`，保证旧账升级即轧平，后续差异只可能来自新两本账。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt |
-  | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
+  | `batches` | id | furnaceId, colorCode, meltDate, remainKg, state, remeltedFrom |
+  | `draws`（v3 技师账） | id | pieceId, batchId, state, **[pieceId+drawSeq]**, stepId |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
   | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
   | `inspects` | id | pieceId, date, result, inspector |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
-  幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
+  幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 / 技师取料道次 → 退火 → 出炉检验**：
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
-  * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
+  * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值；G-101 / A-207 两批故意留出料差异用于对账演示）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
+  * **7 道技师取料道次**：其中 1 道「C-330 余量不足已退回」，用于演示只退回本道与本侧重试；
   * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
 * 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
+  **技师取料道次不随批次/作品删除**——它是按批次对账的凭据，删除后以「批次/作品已删除」单列。
 
 ---
 
@@ -164,4 +174,14 @@ npm run preview      # 预览 dist 产物
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
-* **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
+* **两本账与取料落账**（v3）：
+  * **熔化车间账**在料液批次上记 `chargeKg` 投料量、`recipe` 配方、`outKg` 累计出料量与 `remainKg` 余量；
+    熔化车间不手工记出料；补料同步加投料与余量；改配方只改熔化账；回炉重熔把旧批现存余量整锅转入新批、
+    旧批置「已回炉」并清零，技师历史道次仍挂旧批。
+  * **技师账**为每件作品的每次取料建一道 `draws`（批次、取量、操作人、时间、状态）。
+  * 落账 `postDraw()` 在**同一个 Dexie 读写下事务**内完成「读余量 → 足额则扣余量/累计出料并落账」；
+    不足、批次已回炉或已删除时**只把本道记为「已退回」并写明余量不足，批次余量与别人的道次分文不动**。
+    两个浏览器终端同时保存时 IndexedDB 事务串行提交，晚到的一笔自然读到被扣后的余量而被退回。
+  * **落账失败只按本侧重试** `retryDraw()`：可改批次/取量后重提退回道次，不产生任何熔化侧补偿；已落账道次禁止重提。
+  * **批次对账**（`utils/reconcile.ts`）逐批算两类差异：出料差异 `outKg − 已落账取料量之和`、
+    结存差异 `chargeKg − outKg − remainKg`，阈值 0.05 kg，差异批红行标出「差在哪批、差多少、差在哪侧」。

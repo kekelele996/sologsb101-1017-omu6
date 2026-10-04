@@ -1,6 +1,10 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验
+ * v3 起两本账分立：
+ * - 熔化车间账（batches）：投料量 / 累计出料量 / 配方 / 余量；
+ * - 技师账（draws）：每件作品的取料道次（用哪批料、取多少、谁操作）。
+ * 播种数据故意保留两批「出料量对不上」与一条「余量不足已退回」道次，用于演示对账与本侧重试。
  * 所有 id 固定，保证 /pieces/:id/steps 深链一定命中真实作品与工序。
  */
 import { db, ROW_REVISION } from './db'
@@ -10,6 +14,7 @@ import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
+import type { MaterialDraw } from '../types/draw'
 
 const SEED_TIME = '2026-09-01T02:00:00.000Z'
 
@@ -44,12 +49,61 @@ export async function seedDatabase(): Promise<void> {
     wrap<Furnace>({ id: SEED_IDS.furnaceAnneal, code: 'AN-01', type: '退火窑', maxTempC: 620, fuelType: '电', state: '运行' }),
   ]
 
-  // ---------------- 料液批次（每窑 2 批，含一批低于补料阈值） ----------------
+  // ---------------- 料液批次（熔化车间账：投料 / 累计出料 / 余量） ----------------
+  // G-101 与 A-207 故意制造「出料量对不上」：熔化账累计出料与技师落账合计有差，对账页会标清差在哪批。
   const batches: GlassBatch[] = [
-    wrap<GlassBatch>({ id: SEED_IDS.batchAmber, furnaceId: SEED_IDS.furnaceMelt, colorCode: 'G-101', recipe: '钠钙玻璃基础料 + 氧化钴 0.3%', meltDate: '2026-09-12', tempC: 1180, remainKg: 268 }),
-    wrap<GlassBatch>({ id: SEED_IDS.batchIron, furnaceId: SEED_IDS.furnaceMelt, colorCode: 'A-207', recipe: '钠钙玻璃基础料 + 氧化铁 1.2%', meltDate: '2026-08-28', tempC: 1165, remainKg: 42 }),
-    wrap<GlassBatch>({ id: SEED_IDS.batchCopper, furnaceId: SEED_IDS.furnaceCrucible, colorCode: 'C-330', recipe: '钾铅玻璃 + 氧化铜 0.8%', meltDate: '2026-09-18', tempC: 1120, remainKg: 156 }),
-    wrap<GlassBatch>({ id: SEED_IDS.batchClear, furnaceId: SEED_IDS.furnaceCrucible, colorCode: 'T-045', recipe: '高透钠钙玻璃（无着色剂）', meltDate: '2026-09-05', tempC: 1170, remainKg: 88 }),
+    wrap<GlassBatch>({
+      id: SEED_IDS.batchAmber,
+      furnaceId: SEED_IDS.furnaceMelt,
+      colorCode: 'G-101',
+      recipe: '钠钙玻璃基础料 + 氧化钴 0.3%',
+      meltDate: '2026-09-12',
+      tempC: 1180,
+      chargeKg: 300,
+      outKg: 32,
+      remainKg: 268,
+      state: '在用',
+      remeltedFrom: '',
+    }),
+    wrap<GlassBatch>({
+      id: SEED_IDS.batchIron,
+      furnaceId: SEED_IDS.furnaceMelt,
+      colorCode: 'A-207',
+      recipe: '钠钙玻璃基础料 + 氧化铁 1.2%',
+      meltDate: '2026-08-28',
+      tempC: 1165,
+      chargeKg: 120,
+      outKg: 78,
+      remainKg: 42,
+      state: '在用',
+      remeltedFrom: '',
+    }),
+    wrap<GlassBatch>({
+      id: SEED_IDS.batchCopper,
+      furnaceId: SEED_IDS.furnaceCrucible,
+      colorCode: 'C-330',
+      recipe: '钾铅玻璃 + 氧化铜 0.8%',
+      meltDate: '2026-09-18',
+      tempC: 1120,
+      chargeKg: 200,
+      outKg: 44,
+      remainKg: 156,
+      state: '在用',
+      remeltedFrom: '',
+    }),
+    wrap<GlassBatch>({
+      id: SEED_IDS.batchClear,
+      furnaceId: SEED_IDS.furnaceCrucible,
+      colorCode: 'T-045',
+      recipe: '高透钠钙玻璃（无着色剂）',
+      meltDate: '2026-09-05',
+      tempC: 1170,
+      chargeKg: 160,
+      outKg: 72,
+      remainKg: 88,
+      state: '在用',
+      remeltedFrom: '',
+    }),
   ]
 
   // ---------------- 作品（5 件，覆盖四种状态与三种工艺） ----------------
@@ -82,6 +136,123 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
   ]
 
+  // ---------------- 技师账：取料道次（每件作品各一道；另含补取与一条退回待重试） ----------------
+  const draws: MaterialDraw[] = [
+    wrap<MaterialDraw>({
+      id: 'draw-m1',
+      pieceId: SEED_IDS.pieceMorning,
+      drawSeq: 1,
+      stepId: 'step-m1',
+      batchId: SEED_IDS.batchAmber,
+      kg: 6.2,
+      operator: '林曦',
+      drawnAt: '2026-09-19T08:10',
+      remark: '首料，蘸取三次',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 1,
+      postedAt: '2026-09-19T08:10',
+      migrated: false,
+    }),
+    wrap<MaterialDraw>({
+      id: 'draw-g1',
+      pieceId: SEED_IDS.pieceGreen,
+      drawSeq: 1,
+      stepId: 'step-g1',
+      batchId: SEED_IDS.batchCopper,
+      kg: 9.5,
+      operator: '沈沐',
+      drawnAt: '2026-09-19T09:20',
+      remark: '窑铸浇注重料',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 1,
+      postedAt: '2026-09-19T09:20',
+      migrated: false,
+    }),
+    // 第二道取料：C-330 当时余量不足，本道只退回、未扣料；可在取料台账页只按技师侧重试
+    wrap<MaterialDraw>({
+      id: 'draw-g2',
+      pieceId: SEED_IDS.pieceGreen,
+      drawSeq: 2,
+      stepId: '',
+      batchId: SEED_IDS.batchCopper,
+      kg: 260,
+      operator: '沈沐',
+      drawnAt: '2026-09-19T09:35',
+      remark: '浇注重料补取（数量误填，等待改小后重试）',
+      state: '已退回',
+      rejectReason: '余量不足：批次「C-330」当前余量仅 190.5 kg，本道申请 260 kg；本条已退回、未扣料，别人已取走的不动。',
+      attempts: 1,
+      postedAt: '2026-09-19T09:35',
+      migrated: false,
+    }),
+    wrap<MaterialDraw>({
+      id: 'draw-p1',
+      pieceId: SEED_IDS.piecePaperweight,
+      drawSeq: 1,
+      stepId: 'step-p1',
+      batchId: SEED_IDS.batchIron,
+      kg: 3.1,
+      operator: '郑野',
+      drawnAt: '2026-09-21T10:40',
+      remark: '灯工小块料',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 1,
+      postedAt: '2026-09-21T10:40',
+      migrated: false,
+    }),
+    wrap<MaterialDraw>({
+      id: 'draw-p2',
+      pieceId: SEED_IDS.piecePaperweight,
+      drawSeq: 2,
+      stepId: '',
+      batchId: SEED_IDS.batchIron,
+      kg: 4.5,
+      operator: '郑野',
+      drawnAt: '2026-09-21T11:05',
+      remark: '补色再取一道',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 2,
+      postedAt: '2026-09-21T11:05',
+      migrated: false,
+    }),
+    wrap<MaterialDraw>({
+      id: 'draw-b1',
+      pieceId: SEED_IDS.pieceBottle,
+      drawSeq: 1,
+      stepId: 'step-b1',
+      batchId: SEED_IDS.batchClear,
+      kg: 7.8,
+      operator: '林曦',
+      drawnAt: '2026-09-25T14:00',
+      remark: '长颈瓶首料',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 1,
+      postedAt: '2026-09-25T14:00',
+      migrated: false,
+    }),
+    wrap<MaterialDraw>({
+      id: 'draw-c1',
+      pieceId: SEED_IDS.pieceCup,
+      drawSeq: 1,
+      stepId: 'step-c1',
+      batchId: SEED_IDS.batchAmber,
+      kg: 2.4,
+      operator: '沈沐',
+      drawnAt: '2026-09-28T07:50',
+      remark: '小杯首料',
+      state: '已落账',
+      rejectReason: '',
+      attempts: 1,
+      postedAt: '2026-09-28T07:50',
+      migrated: false,
+    }),
+  ]
+
   // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
   const anneals: Anneal[] = [
     wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
@@ -97,12 +268,17 @@ export async function seedDatabase(): Promise<void> {
     wrap<Inspect>({ id: 'inspect-g2', pieceId: SEED_IDS.pieceGreen, result: '合格', defectNote: '回炉修补后复检合格。', inspector: '吴岚', date: '2026-09-25' }),
   ]
 
-  await db.transaction('rw', [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects], async () => {
-    await db.furnaces.bulkPut(furnaces)
-    await db.batches.bulkPut(batches)
-    await db.pieces.bulkPut(pieces)
-    await db.steps.bulkPut(steps)
-    await db.anneals.bulkPut(anneals)
-    await db.inspects.bulkPut(inspects)
-  })
+  await db.transaction(
+    'rw',
+    [db.furnaces, db.batches, db.pieces, db.steps, db.anneals, db.inspects, db.draws],
+    async () => {
+      await db.furnaces.bulkPut(furnaces)
+      await db.batches.bulkPut(batches)
+      await db.pieces.bulkPut(pieces)
+      await db.steps.bulkPut(steps)
+      await db.draws.bulkPut(draws)
+      await db.anneals.bulkPut(anneals)
+      await db.inspects.bulkPut(inspects)
+    }
+  )
 }

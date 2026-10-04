@@ -1,6 +1,8 @@
 /**
- * 窑炉与料液状态管理（Pinia）
- * 维护窑炉列表、料液批次及剩余量；取料按剩余量扣减，低于阈值高亮提示补料。
+ * 熔化车间账状态管理（Pinia）
+ * 维护窑炉列表与料液批次：批次上记投料量、累计出料量、配方与余量。
+ * - 取料不在这里直接扣：唯一扣料入口是技师账 postDraw（按当时余量原子扣减 outKg / remainKg）；
+ * - 补料同步加投料量与余量；回炉重熔把旧批余量转入新批并给旧批封账；改配方只改本账 recipe。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -10,16 +12,17 @@ import type { GlassBatch, GlassBatchDraft } from '../types/batch'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
-  consumeBatch,
   countAll,
   db,
   initDatabase,
   putBatch,
   putFurnace,
+  refillBatch,
+  remeltBatch,
   removeBatch,
   removeFurnace,
 } from '../utils/db'
-import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
+import { isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 窑炉筛选条件 */
@@ -66,7 +69,9 @@ export const useFurnaceStore = defineStore('furnace', () => {
     furnaces.value.filter((row) => row.type === '熔化炉' || row.type === '坩埚炉')
   )
   const annealingFurnaces = computed<Furnace[]>(() => furnaces.value.filter((row) => row.type === '退火窑'))
-  const lowRemainBatches = computed<GlassBatch[]>(() => batches.value.filter((row) => isLowRemain(row.remainKg)))
+  const lowRemainBatches = computed<GlassBatch[]>(() =>
+    batches.value.filter((row) => row.state === '在用' && isLowRemain(row.remainKg))
+  )
 
   const stats = computed<Record<string, FurnaceStat>>(() => {
     const result: Record<string, FurnaceStat> = {}
@@ -77,7 +82,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
         furnaceId: furnace.id,
         batchCount: list.length,
         totalRemainKg: Math.round(list.reduce((acc, row) => acc + row.remainKg, 0) * 10) / 10,
-        lowCount: list.filter((row) => isLowRemain(row.remainKg)).length,
+        lowCount: list.filter((row) => row.state === '在用' && isLowRemain(row.remainKg)).length,
         pieceCount: pieces.value.filter((row) => batchIds.has(row.batchId)).length,
       }
     })
@@ -104,6 +109,10 @@ export const useFurnaceStore = defineStore('furnace', () => {
 
   function batchesOf(furnaceId: string): GlassBatch[] {
     return batches.value.filter((row) => row.furnaceId === furnaceId)
+  }
+
+  function batchById(batchId: string): GlassBatch | undefined {
+    return batches.value.find((row) => row.id === batchId)
   }
 
   async function loadAll(): Promise<void> {
@@ -188,11 +197,16 @@ export const useFurnaceStore = defineStore('furnace', () => {
     await removeFurnace(furnaceId)
     await refreshCounts()
     revision.value += 1
-    lastMessage.value = '窑炉及其料液批次已删除'
+    lastMessage.value = '窑炉及其料液批次已删除；技师取料道次保留用于对账'
   }
 
+  /**
+   * 登记料液批次（熔化车间账）。
+   * 新批投料量按表单填写，尚未出料 outKg=0；余量初始等于投料量（可由表单覆写为盘点余量）。
+   */
   async function createBatch(draft: GlassBatchDraft): Promise<GlassBatch> {
     const stamp = nowIso()
+    const charge = draft.chargeKg
     const row: GlassBatch = {
       id: uuid('batch'),
       furnaceId: draft.furnaceId,
@@ -200,16 +214,25 @@ export const useFurnaceStore = defineStore('furnace', () => {
       recipe: draft.recipe.trim(),
       meltDate: draft.meltDate,
       tempC: draft.tempC,
+      chargeKg: charge,
+      outKg: 0,
       remainKg: draft.remainKg,
+      state: draft.state,
+      remeltedFrom: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
     await putBatch(row)
     revision.value += 1
+    lastMessage.value = `料液批次「${row.colorCode}」已登记：投料 ${charge} kg，取料由技师在取料台账按余量扣`
     return row
   }
 
+  /**
+   * 编辑批次（熔化车间账）。
+   * 改配方只改本账 recipe，技师已落账道次照旧保留；投料量/余量按盘点值更新，累计出料量不手工改。
+   */
   async function updateBatch(batchId: string, draft: GlassBatchDraft): Promise<void> {
     const existing = batches.value.find((row) => row.id === batchId)
     if (existing === undefined) return
@@ -220,37 +243,43 @@ export const useFurnaceStore = defineStore('furnace', () => {
       recipe: draft.recipe.trim(),
       meltDate: draft.meltDate,
       tempC: draft.tempC,
+      chargeKg: draft.chargeKg,
       remainKg: draft.remainKg,
+      state: draft.state,
     })
     revision.value += 1
+    lastMessage.value = `批次「${draft.colorCode.trim() || existing.colorCode}」熔化账已更新（改配方不影响技师历史道次）`
   }
 
   async function deleteBatch(batchId: string): Promise<void> {
     await removeBatch(batchId)
     revision.value += 1
+    lastMessage.value = '料液批次已删除；技师取料道次保留，对账时会列为无批次归属'
   }
 
-  /** 取料：按剩余量扣减，返回实际扣减量 */
-  async function consume(batchId: string, kg: number): Promise<number> {
-    const actual = await consumeBatch(batchId, kg)
-    revision.value += 1
-    const batch = batches.value.find((row) => row.id === batchId)
-    if (batch !== undefined) {
-      const remain = Math.round((batch.remainKg - actual) * 10) / 10
-      lastMessage.value = isLowRemain(remain)
-        ? `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`
-        : `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg`
-    }
-    return actual
-  }
-
-  /** 补料：直接增加剩余量 */
+  /** 补料：投料量与余量同步增加（累计出料量不动） */
   async function refill(batchId: string, kg: number): Promise<void> {
     const batch = batches.value.find((row) => row.id === batchId)
     if (batch === undefined) return
-    await putBatch({ ...batch, remainKg: Math.round((batch.remainKg + kg) * 10) / 10 })
+    await refillBatch(batchId, kg)
     revision.value += 1
-    lastMessage.value = `已为 ${batch.colorCode} 补料 ${kg} kg`
+    lastMessage.value = `已为 ${batch.colorCode} 补料 ${kg} kg（投料量与余量同步增加）`
+  }
+
+  /**
+   * 回炉重熔：旧批现存余量整锅转入新批，可同时改配方/色号。
+   * 旧批封账（余量清零、状态已回炉）；技师取料道次照旧挂在旧批上，对账时仍按旧批归属。
+   */
+  async function remelt(
+    oldId: string,
+    draft: Pick<GlassBatchDraft, 'furnaceId' | 'colorCode' | 'recipe' | 'meltDate' | 'tempC'>
+  ): Promise<GlassBatch | null> {
+    const created = await remeltBatch(oldId, draft)
+    revision.value += 1
+    if (created !== null) {
+      lastMessage.value = `已回炉重熔为新批「${created.colorCode}」，转入余量 ${created.remainKg} kg；旧批封账，技师历史道次保留`
+    }
+    return created
   }
 
   async function refreshCounts(): Promise<void> {
@@ -275,6 +304,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     visibleFurnaces,
     statOf,
     batchesOf,
+    batchById,
     loadAll,
     setFilters,
     resetFilters,
@@ -284,8 +314,8 @@ export const useFurnaceStore = defineStore('furnace', () => {
     createBatch,
     updateBatch,
     deleteBatch,
-    consume,
     refill,
+    remelt,
     refreshCounts,
   }
 })

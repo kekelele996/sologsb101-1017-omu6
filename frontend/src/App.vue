@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, DocumentChecked, Odometer, SetUp, Sunrise } from '@element-plus/icons-vue'
+import { Box, DocumentChecked, Money, Odometer, SetUp, Sunrise, Tickets } from '@element-plus/icons-vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { useAnnealStore } from '@/stores/annealStore'
+import { useDrawStore } from '@/stores/drawStore'
 import { ROUTES } from '@/router'
 
 const route = useRoute()
@@ -16,11 +17,14 @@ const router = useRouter()
 const furnaceStore = useFurnaceStore()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
+const drawStore = useDrawStore()
 
 const navItems = computed(() => {
   const currentPieceId = pieceStore.currentPieceId
   return [
-    { path: ROUTES.furnaces, label: '窑炉料液', icon: SetUp, badge: String(furnaceStore.furnaces.length) },
+    { path: ROUTES.furnaces, label: '熔化车间账', icon: SetUp, badge: String(furnaceStore.batches.length) },
+    { path: ROUTES.draws, label: '技师取料台账', icon: Tickets, badge: String(drawStore.draws.length) },
+    { path: ROUTES.reconcile, label: '批次对账', icon: Money, badge: '' },
     { path: ROUTES.pieces, label: '作品登记', icon: Box, badge: String(pieceStore.pieces.length) },
     {
       path: currentPieceId ? ROUTES.steps(currentPieceId) : ROUTES.pieces,
@@ -43,11 +47,13 @@ const activePath = computed<string>(() => {
 })
 
 const lowRemain = computed<number>(() => furnaceStore.lowRemainBatches.length)
+const returnedCount = computed<number>(() => drawStore.returnedDraws.length)
 
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
   void annealStore.loadAll()
+  void drawStore.loadAll()
 })
 
 function go(path: string): void {
@@ -86,6 +92,7 @@ function go(path: string): void {
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
+        <el-tag v-if="returnedCount > 0" type="warning" effect="dark">取料退回 {{ returnedCount }} 道</el-tag>
       </div>
     </header>
 
@@ -98,10 +105,9 @@ function go(path: string): void {
     <footer class="app-footer">
       <span>数据仅存于本浏览器（IndexedDB 库名 gbglassblow / localStorage），不上传任何服务器。</span>
       <span>
-        窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 作品
-        {{ pieceStore.pieces.length }} · 工序 {{ pieceStore.steps.length }} · 结构版本 v{{
-          furnaceStore.counts.schemaVersion ?? '-'
-        }}
+        窑炉 {{ furnaceStore.furnaces.length }} · 料液 {{ furnaceStore.batches.length }} · 取料道次
+        {{ drawStore.draws.length }} · 作品 {{ pieceStore.pieces.length }} · 工序
+        {{ pieceStore.steps.length }} · 结构版本 v{{ furnaceStore.counts.schemaVersion ?? '-' }}
       </span>
     </footer>
   </div>

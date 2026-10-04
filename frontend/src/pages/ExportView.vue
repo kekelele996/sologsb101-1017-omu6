@@ -14,6 +14,7 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useDrawStore } from '@/stores/drawStore'
 import { DB_NAME, DB_SCHEMA_VERSION, db, exportSnapshot, importSnapshot, resetDatabase } from '@/utils/db'
 import { exportScheduleCsvFile, exportSnapshotJson, parseSnapshot } from '@/utils/export'
 import { useIdbTable } from '@/hooks/useIdbTable'
@@ -24,6 +25,7 @@ const router = useRouter()
 const pieceStore = usePieceStore()
 const annealStore = useAnnealStore()
 const furnaceStore = useFurnaceStore()
+const drawStore = useDrawStore()
 
 const { rows, loading, create, update, remove } = useIdbTable<Inspect>(db.inspects, { sortByUpdatedAt: false })
 
@@ -88,6 +90,7 @@ onMounted(() => {
   void pieceStore.loadAll()
   void annealStore.loadAll()
   void furnaceStore.loadAll()
+  void drawStore.loadAll()
 })
 
 function openCreate(): void {
@@ -179,7 +182,7 @@ async function handleImport(uploadFile: UploadFile): Promise<void> {
     return
   }
   await importSnapshot(result.snapshot)
-  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+  await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), drawStore.loadAll()])
   ElMessage.success(`导入成功：${result.message}`)
 }
 
@@ -191,7 +194,7 @@ function handleReset(): void {
   )
     .then(async () => {
       await resetDatabase()
-      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll()])
+      await Promise.all([pieceStore.loadAll(), annealStore.loadAll(), furnaceStore.loadAll(), drawStore.loadAll()])
       ElMessage.success('已重置为演示数据')
     })
     .catch(() => undefined)
@@ -221,7 +224,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 起熔化车间账与技师取料账分立，旧版取料工序按作品批次迁移为取料道次"
       />
     </div>
 

@@ -13,14 +13,17 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useDrawStore } from '@/stores/drawStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
+import { ROUTES } from '@/router'
 
 const route = useRoute()
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const drawStore = useDrawStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
@@ -73,7 +76,16 @@ const currentStep = computed<Step | null>(() => steps.value.find((row) => row.st
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
+  void drawStore.loadAll()
 })
+
+/** 本作品的技师取料道次（与吹制工序两本账分立，各记各的） */
+const pieceDraws = computed(() => drawStore.drawsOfPiece(pieceId.value))
+const piecePostedKg = computed(() => drawStore.postedKgOfPiece(pieceId.value))
+
+function goDrawLedger(): void {
+  void router.push({ path: ROUTES.draws, query: { piece: pieceId.value } })
+}
 
 function openCreate(): void {
   editingId.value = null
@@ -186,6 +198,10 @@ function goAnnealing(): void {
           <el-tag v-if="furnace" type="info">{{ furnace.code }} · 上限 {{ furnace.maxTempC }} ℃</el-tag>
           <el-tag v-if="batch" type="success">{{ batch.colorCode }} · 余 {{ batch.remainKg }} kg</el-tag>
           <el-tag v-if="piece" type="warning">理论退火 {{ formatHours(totalAnnealHours(piece.wallThicknessMm)) }}</el-tag>
+          <el-button size="small" @click="goDrawLedger">
+            <el-icon><Tickets /></el-icon>
+            <span>取料台账（{{ pieceDraws.length }} 道 / {{ piecePostedKg }} kg）</span>
+          </el-button>
         </el-space>
       </template>
     </el-page-header>
@@ -313,6 +329,58 @@ function goAnnealing(): void {
             </div>
           </li>
         </ul>
+      </el-card>
+
+      <el-card shadow="never" class="mt-14">
+        <template #header>
+          <div class="card-header">
+            <span class="card-header__title">取料道次（技师账 · 与工序各记各的）</span>
+            <el-button type="primary" plain size="small" @click="goDrawLedger">
+              <el-icon><Tickets /></el-icon>
+              <span>去取料台账登记 / 重试</span>
+            </el-button>
+          </div>
+        </template>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          title="取料在「取料台账」逐道登记：用哪批料、取多少、谁操作；保存时按批次当时余量原子扣减，余量不足只退回本道。"
+          description="批次回炉重熔或改配方后，这里的历史道次照旧保留；与熔化车间账在「批次对账」页核对。"
+          class="mb-12"
+        />
+        <EmptyPanel
+          v-if="pieceDraws.length === 0"
+          title="这件作品还没有取料道次"
+          description="取料与吹制工序分开记账：到取料台账为该作品登记第一道取料。"
+          action-text="去登记取料"
+          @action="goDrawLedger"
+        />
+        <el-table v-else :data="pieceDraws" row-key="id" size="small" stripe>
+          <el-table-column label="道次" width="70" align="center">
+            <template #default="{ row }">第 {{ row.drawSeq }} 道</template>
+          </el-table-column>
+          <el-table-column label="料液批次" min-width="180">
+            <template #default="{ row }">
+              <span>{{ furnaceStore.batchById(row.batchId)?.colorCode ?? '（批次已删除）' }}</span>
+              <span v-if="furnaceStore.batchById(row.batchId)?.state === '已回炉'" class="cell-sub"> · 已回炉，道次保留</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="取料量" width="100" align="right">
+            <template #default="{ row }"><b>{{ row.kg }} kg</b></template>
+          </el-table-column>
+          <el-table-column prop="operator" label="操作人" width="100" />
+          <el-table-column label="取料时间" min-width="150">
+            <template #default="{ row }">{{ row.drawnAt.replace('T', ' ') }}</template>
+          </el-table-column>
+          <el-table-column label="状态 / 说明" min-width="240">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.state === '已落账' ? 'success' : 'danger'">{{ row.state }}</el-tag>
+              <span v-if="row.state === '已退回'" class="cell-warn"> {{ row.rejectReason }}</span>
+              <span v-else-if="row.remark" class="cell-sub"> {{ row.remark }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
       </el-card>
     </template>
 
@@ -472,6 +540,20 @@ function goAnnealing(): void {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.cell-sub {
+  font-size: 12px;
+  color: #8b95a1;
+}
+
+.cell-warn {
+  font-size: 12px;
+  color: #c0392b;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
 }
 
 .mt-14 {
